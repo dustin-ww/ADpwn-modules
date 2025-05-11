@@ -7,35 +7,6 @@ import (
 	"ADPwn-core/pkg/sse"
 )
 
-type DNSExplorer struct {
-	Dependencies []string
-	Modes        []string
-	configKey    string
-}
-
-func (n *DNSExplorer) ConfigKey() string {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (n *DNSExplorer) SetServices(services *adpwnsdk.Services) {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (n *DNSExplorer) DependsOn() int {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (n *DNSExplorer) GetDependencies() []string {
-	return n.Dependencies
-}
-
-func (n *DNSExplorer) ExecuteModule(params *input.Parameter, logger *sse.SSELogger) error {
-	return nil
-}
-
 // INIT
 func init() {
 	module := &DNSExplorer{
@@ -43,4 +14,27 @@ func init() {
 	}
 	plugin.RegisterPlugin(module)
 
+}
+
+type DNSExplorer struct {
+	// Internal
+	configKey string
+	// Services
+	services *adpwnsdk.Services
+	// Tool Adaptera
+	logger *sse.SSELogger
+}
+
+func (n *DNSExplorer) ConfigKey() string {
+	return n.configKey
+}
+
+func (n *DNSExplorer) SetServices(services *adpwnsdk.Services) {
+	n.services = services
+}
+
+// THIS METHOD IS CALLED BY THE ADpwn CORE
+func (n *DNSExplorer) ExecuteModule(params *input.Parameter, logger *sse.SSELogger) error {
+	// INSERT MAIN LOGIC HERE
+	return nil
 }
