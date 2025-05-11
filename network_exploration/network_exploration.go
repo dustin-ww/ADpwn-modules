@@ -106,10 +106,16 @@ func (n *NetworkExplorer) processScanResults(nmapResult scan.NmapScanResult, par
 		var hostUID string
 
 		// try to build/get domain from host
-		domainUID = n.tryToBuildDomain(nmapResult, host.Address[0].Addr, params)
+		domainUID, err := n.tryToBuildDomain(nmapResult, host.Address[0].Addr, params)
+		if err != nil {
+			n.logger.Error("failed to build domain", "ip", host.Address[0].Addr, "error", err)
+		}
 
 		// BUILD HOST
-		hostUID = n.buildHost(nmapResult, params, domainUID)
+		hostUID, err = n.buildHost(nmapResult, host.Address[0].Addr, params, domainUID)
+		if err != nil {
+			n.logger.Error("failed to build host", "ip", host.Address[0].Addr, "error", err)
+		}
 
 		// BUILD SERVICES
 		n.buildServices(host, hostUID)
@@ -117,97 +123,149 @@ func (n *NetworkExplorer) processScanResults(nmapResult scan.NmapScanResult, par
 	}
 }
 
-func (n *NetworkExplorer) buildHost(nmapResult scan.NmapScanResult, params *input.Parameter, domainUID string) string {
-	/*host
-
-	if domainUID == "" {
-		domain, err := n.services.HostService.CreateWithUnknownDomain(context.Background())
-		if err != nil {
-			return ""
-		}
-	}*/
-	return ""
-
-}
-
-func (n *NetworkExplorer) tryToBuildDomain(nmapResult scan.NmapScanResult, ip string, params *input.Parameter) string {
-	document, err := nmapResult.GetXMLDocument()
-	if err != nil {
-		n.logger.Error(fmt.Sprintf("[Network Explorer] Error while parsing: %v", err))
-		return ""
+func (n *NetworkExplorer) buildHost(nmapResult scan.NmapScanResult, ip string, params *input.Parameter, domainUID string) (string, error) {
+	if ip == "" {
+		return "", fmt.Errorf("IP cannot be empty")
 	}
 
-	// Erstelle einen XPath-Builder für die gegebene IP
+	if params == nil {
+		return "", fmt.Errorf("parameters cannot be nil")
+	}
+
+	document, err := nmapResult.GetXMLDocument()
+	if err != nil {
+		n.logger.Error("failed to parse nmap XML document", "ip", ip, "error", err)
+		return "", err
+	}
+
+	xpathBuilder := internal.NewXPathBuilder(ip)
+	hostBuilder := model.NewHostBuilder()
+	hostBuilder.WithIP(ip)
+
+	// Extract hostname
+	xpath := xpathBuilder.Hostname()
+	if node := xmlquery.FindOne(document, xpath); node != nil {
+		hostBuilder.WithName(node.InnerText())
+	}
+
+	host, err := hostBuilder.Build()
+	if err != nil {
+		return "", fmt.Errorf("failed to build host: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create the host in the appropriate domain
+	var hostUID string
+	if domainUID != "" {
+		hostUID, err = n.services.DomainService.AddHost(ctx, domainUID, host)
+		if err != nil {
+			return "", fmt.Errorf("failed to add host to domain: %v", err)
+		}
+	} else {
+		hostUID, err = n.services.HostService.CreateWithUnknownDomain(ctx, host, params.ProjectUID)
+		if err != nil {
+			return "", fmt.Errorf("failed to create host: %v", err)
+		}
+	}
+
+	return hostUID, nil
+}
+
+func (n *NetworkExplorer) tryToBuildDomain(nmapResult scan.NmapScanResult, ip string, params *input.Parameter) (string, error) {
+	if ip == "" {
+		return "", fmt.Errorf("IP cannot be empty")
+	}
+
+	if params == nil {
+		return "", fmt.Errorf("parameters cannot be nil")
+	}
+
+	document, err := nmapResult.GetXMLDocument()
+	if err != nil {
+		return "", fmt.Errorf("failed to parse nmap XML document: %v", err)
+	}
+
 	xpathBuilder := internal.NewXPathBuilder(ip)
 
 	ports := []string{"389", "636", "3268", "3269"}
+
+	strategies := []struct {
+		name     string
+		getXPath func(port string) string
+		extract  func(string) string
+	}{
+		{
+			name:     "LDAP Info",
+			getXPath: xpathBuilder.LDAPExtraInfo,
+			extract:  extractDomainFromExtrainfo,
+		},
+		{
+			name:     "Certificate Common Name",
+			getXPath: xpathBuilder.SSLCertCommonName,
+			extract:  extractDomainFromFQDN,
+		},
+		{
+			name:     "SAN-DNS",
+			getXPath: xpathBuilder.SSLCertSANDNS,
+			extract: func(text string) string {
+				return extractDomainFromFQDN(strings.TrimPrefix(text, "DNS:"))
+			},
+		},
+		{
+			name:     "issuer domainComponent",
+			getXPath: xpathBuilder.SSLCertDomainComponent,
+			extract: func(text string) string {
+				return text + ".local"
+			},
+		},
+	}
+
 	var domain string
+	var usedStrategy string
 
-	// 1. Domain from LDAP Info
-	for _, port := range ports {
-		xpath := xpathBuilder.LDAPExtraInfo(port)
-		if node := xmlquery.FindOne(document, xpath); node != nil {
-			domain = extractDomainFromExtrainfo(node.InnerText())
-			if domain != "" {
-				break
-			}
-		}
-	}
-
-	// 2. From Certificate Common Name
-	if domain == "" {
+	for _, strategy := range strategies {
 		for _, port := range ports {
-			xpath := xpathBuilder.SSLCertCommonName(port)
+			xpath := strategy.getXPath(port)
 			if node := xmlquery.FindOne(document, xpath); node != nil {
-				domain = extractDomainFromFQDN(node.InnerText())
+				domain = strategy.extract(node.InnerText())
 				if domain != "" {
+					usedStrategy = strategy.name
 					break
 				}
 			}
 		}
-	}
-
-	// 3. From SAN-DNS
-	if domain == "" {
-		for _, port := range ports {
-			xpath := xpathBuilder.SSLCertSANDNS(port)
-			if node := xmlquery.FindOne(document, xpath); node != nil {
-				domain = extractDomainFromFQDN(strings.TrimPrefix(node.InnerText(), "DNS:"))
-				if domain != "" {
-					break
-				}
-			}
-		}
-	}
-
-	// 4. From issuer domainComponent
-	if domain == "" {
-		for _, port := range ports {
-			xpath := xpathBuilder.SSLCertDomainComponent(port)
-			if node := xmlquery.FindOne(document, xpath); node != nil {
-				domain = node.InnerText() + ".local"
-				break
-			}
+		if domain != "" {
+			break
 		}
 	}
 
 	if domain == "" {
-		n.logger.Info(fmt.Sprintf("Could not determine domain from nmap results for host %s", ip))
-		return ""
+		return "", fmt.Errorf("could not determine domain from nmap results")
 	}
 
 	domainBuilder := model.NewDomainBuilder()
 	domainBuilder.WithName(domain)
 	builtDomain := domainBuilder.Build()
 
-	addedDomain, err := n.services.ProjectService.AddDomain(context.Background(), params.ProjectUID, &builtDomain)
+	ctx := context.Background()
+	addedDomainID, err := n.services.ProjectService.AddDomain(ctx, params.ProjectUID, &builtDomain)
 	if err != nil {
-		n.logger.Error(fmt.Sprintf("Error while creating domain for host: %s: %v", domain, err))
-		return ""
+		n.logger.Error("failed to create domain for host",
+			"domain", domain,
+			"ip", ip,
+			"project", params.ProjectUID,
+			"error", err)
+		return "", err
 	}
 
-	n.logger.Info(fmt.Sprintf("Network Explorer Module created a domain: %s for host %s", domain, ip))
-	return addedDomain
+	n.logger.Info("created domain for host",
+		"domain", domain,
+		"ip", ip,
+		"strategy", usedStrategy,
+		"domainID", addedDomainID)
+
+	return addedDomainID, nil
 }
 
 func extractDomainFromExtrainfo(info string) string {
@@ -251,30 +309,6 @@ func (n *NetworkExplorer) buildDomainName(nmapResult scan.NmapScanResult) string
 	return ""
 }
 
-func (n *NetworkExplorer) buildHosts(nmapResult scan.NmapScanResult, params *input.Parameter) {
-
-	/*for _, host := range nmapResult.GetNmapResult().Host {
-
-		host, err := model.NewHostBuilder().Build()
-
-		for _, port := range host.Ports.Port {
-
-			xmlStr := nmapResult.GetRawOutput()
-			doc, err := xmlquery.Parse(strings.NewReader(string(xmlStr)))
-
-			if err != nil {
-				log.Printf("ERRRRROR")
-			}
-
-			xpath := "//port[@portid='389']/script[@id='ssl-cert']/table[@key='subject']/elem[@key='commonName']"
-			node := xmlquery.FindOne(doc, xpath)
-			node.InnerText()
-
-		}
-	}*/
-
-}
-
 func (n *NetworkExplorer) buildServices(host serializable.Host, hostID string) {
 
 	for _, port := range host.Ports.Port {
@@ -303,14 +337,12 @@ func (n *NetworkExplorer) isDomainController(nmapResult scan.NmapScanResult, ip 
 
 	xpathBuilder := internal.NewXPathBuilder(ip)
 
-	// Prüfe direkt mit XPath, ob es sich um einen Domain Controller handelt
 	dcXPath := xpathBuilder.IsDomainController()
 
 	if node := xmlquery.FindOne(document, dcXPath); node != nil {
 		return true
 	}
 
-	// Alternative Überprüfung: Zähle DC-typische Ports
 	dcPorts := map[string]bool{
 		"53":   true, // DNS
 		"88":   true, // Kerberos
@@ -324,20 +356,17 @@ func (n *NetworkExplorer) isDomainController(nmapResult scan.NmapScanResult, ip 
 
 	matchCount := 0
 
-	// Überprüfe offene Ports
 	for portID := range dcPorts {
 		portXPath := fmt.Sprintf("%s/ports/port[@portid='%s' and state/@state='open']", xpathBuilder.Host(), portID)
 		if node := xmlquery.FindOne(document, portXPath); node != nil {
 			matchCount++
 
-			// Kerberos (Port 88) ist ein starker Indikator für einen DC
 			if portID == "88" {
 				return true
 			}
 		}
 	}
 
-	// Überprüfe Dienste
 	serviceTypes := []string{"ldap", "kerberos", "msrpc"}
 	for _, serviceType := range serviceTypes {
 		serviceXPath := fmt.Sprintf("%s/ports/port[state/@state='open']/service[@name='%s']", xpathBuilder.Host(), serviceType)
